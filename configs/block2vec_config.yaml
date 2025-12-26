@@ -1,0 +1,41 @@
+# Block2Vec Configuration
+# Training settings for block embedding model
+
+# Model Architecture
+embedding_dim: 32          # Dimension of block embeddings (32 is standard)
+vocab_size: null           # Set automatically from vocabulary
+
+# Training
+epochs: 50                 # Number of training epochs
+batch_size: 4096           # Large batches work well for skip-gram
+learning_rate: 0.001       # Adam optimizer learning rate
+weight_decay: 0.0001       # L2 regularization
+
+# Context Window
+context_type: "neighbors_6"  # Options: "neighbors_6" (adjacent), "neighbors_26" (3x3x3 cube)
+# neighbors_6: Only the 6 directly adjacent blocks (up, down, north, south, east, west)
+# neighbors_26: All 26 blocks in a 3x3x3 cube around the center
+
+# Negative Sampling
+num_negative_samples: 5    # Number of negative samples per positive pair
+negative_sampling_power: 0.75  # Power for frequency-based negative sampling
+
+# Subsampling (handle frequent blocks like air)
+subsample_threshold: 0.001  # Blocks more frequent than this get subsampled
+# This helps prevent "air" from dominating training
+
+# Data
+min_block_frequency: 10    # Ignore blocks that appear less than this many times
+include_air: true          # Whether to include air blocks in training
+# Air is ~75% of blocks, but useful for learning "empty space" concept
+
+# Checkpoints
+save_every_epochs: 10      # Save checkpoint every N epochs
+checkpoint_dir: "checkpoints/block2vec"
+
+# Logging
+log_every_steps: 1000      # Log training progress every N steps
+tensorboard_dir: "logs/tensorboard/block2vec"
+
+# Reproducibility
+seed: 42                   # Random seed for reproducibility

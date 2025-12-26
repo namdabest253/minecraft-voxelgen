@@ -1,0 +1,69 @@
+# VQ-VAE Configuration
+# Vector Quantized Variational Autoencoder settings
+
+# Input
+input_size: [32, 32, 32]   # Structure dimensions [height, depth, width]
+input_channels: 32         # Block embedding dimension (from block2vec)
+
+# Encoder Architecture
+encoder:
+  channels: [64, 128, 256, 512]  # Channel progression through layers
+  # 32->64->128->256->512
+  kernel_size: 4           # Convolution kernel size
+  stride: 2                # Stride of 2 halves spatial dims each layer
+  # 32x32x32 -> 16x16x16 -> 8x8x8 -> 4x4x4 -> 2x2x2
+  activation: "leaky_relu" # Options: "relu", "leaky_relu", "gelu"
+  use_batch_norm: true     # Batch normalization after convolutions
+
+# Decoder Architecture (mirrors encoder)
+decoder:
+  channels: [512, 256, 128, 64, 32]  # Reverse of encoder
+  kernel_size: 4
+  stride: 2
+  activation: "leaky_relu"
+  use_batch_norm: true
+
+# Vector Quantization
+codebook:
+  num_embeddings: 512      # Number of codebook entries (pattern atoms)
+  embedding_dim: 512       # Dimension of each codebook vector
+  commitment_cost: 0.25    # Beta in commitment loss (0.25 is standard)
+  decay: 0.99              # EMA decay for codebook update (if using EMA)
+  use_ema: true            # Use exponential moving average for codebook
+  # EMA is more stable than gradient-based codebook updates
+
+# Loss Weights
+loss:
+  reconstruction_weight: 1.0     # Weight for reconstruction loss
+  codebook_weight: 1.0           # Weight for codebook loss
+  commitment_weight: 0.25        # Weight for commitment loss (same as commitment_cost)
+  # Total loss = recon + codebook + commitment_weight * commitment
+
+# Training
+training:
+  epochs: 100              # Number of training epochs
+  batch_size: 16           # Batch size (limited by GPU memory)
+  learning_rate: 0.0002    # Adam optimizer learning rate
+  weight_decay: 0.0        # L2 regularization (usually 0 for VAEs)
+  lr_scheduler: "cosine"   # Options: "none", "cosine", "step"
+  warmup_epochs: 5         # Linear warmup for learning rate
+
+# Optimizer
+optimizer:
+  type: "adam"             # Options: "adam", "adamw"
+  betas: [0.9, 0.999]      # Adam beta parameters
+  eps: 0.00000001          # Adam epsilon
+
+# Checkpoints
+save_every_epochs: 10
+checkpoint_dir: "checkpoints/vqvae"
+save_best: true            # Save model with best validation loss
+
+# Logging
+log_every_steps: 100
+tensorboard_dir: "logs/tensorboard/vqvae"
+log_reconstructions: true  # Log sample reconstructions to tensorboard
+num_reconstruction_samples: 4  # Number of samples to log
+
+# Reproducibility
+seed: 42

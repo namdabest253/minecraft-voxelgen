@@ -1,0 +1,91 @@
+# General Training Configuration
+# Shared settings across all training phases
+
+# Data Paths
+paths:
+  # Raw data
+  schematics_dir: "../schematics"  # Original .schematic files (10,963 files)
+
+  # Processed data
+  processed_dir: "data/processed"
+  structures_dir: "data/processed/structures"  # Parsed numpy arrays
+  train_dir: "data/processed/train"
+  val_dir: "data/processed/val"
+  test_dir: "data/processed/test"
+
+  # Vocabulary
+  vocabulary_dir: "data/vocabulary"
+  block_to_id: "data/vocabulary/block_to_id.json"
+  id_to_block: "data/vocabulary/id_to_block.json"
+
+  # Embeddings
+  embeddings_dir: "data/embeddings"
+  block2vec_embeddings: "data/embeddings/block2vec_32d.npy"
+
+  # Checkpoints
+  checkpoints_dir: "checkpoints"
+
+  # Logs
+  logs_dir: "logs"
+  tensorboard_dir: "logs/tensorboard"
+
+  # Outputs
+  outputs_dir: "outputs"
+  generated_dir: "outputs/generated"
+  schematics_out_dir: "outputs/schematics"
+  nbt_out_dir: "outputs/nbt"
+
+# Data Splitting
+data_split:
+  train_ratio: 0.8         # 80% for training
+  val_ratio: 0.1           # 10% for validation
+  test_ratio: 0.1          # 10% for testing
+  shuffle: true            # Shuffle before splitting
+  stratify: false          # Don't stratify (no labels yet)
+
+# Structure Normalization
+normalization:
+  target_size: [32, 32, 32]  # Target structure size
+  method: "pad"            # Options: "pad", "crop", "chunk"
+  # pad: Pad smaller structures with air
+  # crop: Crop larger structures to target size
+  # chunk: Split large structures into overlapping chunks
+  pad_value: 0             # Block ID for padding (0 = air)
+  chunk_overlap: 8         # Overlap when chunking (if method="chunk")
+
+# Data Augmentation
+augmentation:
+  enabled: true
+  rotations: true          # 90-degree rotations around Y axis
+  flips: true              # Horizontal flips
+  # Note: Don't flip vertically (gravity matters in Minecraft)
+
+# DataLoader
+dataloader:
+  num_workers: 4           # Parallel data loading workers
+  pin_memory: true         # Pin memory for faster GPU transfer
+  prefetch_factor: 2       # Batches to prefetch per worker
+
+# Hardware
+hardware:
+  device: "auto"           # Options: "auto", "cuda", "cpu", "mps"
+  # auto: Use CUDA if available, else CPU
+  mixed_precision: true    # Use FP16 for faster training (if GPU supports)
+  compile_model: false     # Use torch.compile (PyTorch 2.0+)
+
+# Reproducibility
+seed: 42
+deterministic: false       # Set true for fully deterministic (slower)
+
+# Logging
+logging:
+  level: "INFO"            # Options: DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_file: "logs/training.log"
+
+# Early Stopping
+early_stopping:
+  enabled: true
+  patience: 10             # Stop if no improvement for N epochs
+  min_delta: 0.001         # Minimum change to count as improvement
+  monitor: "val_loss"      # Metric to monitor

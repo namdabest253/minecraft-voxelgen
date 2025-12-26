@@ -1,0 +1,53 @@
+# Pre-commit hooks for code quality
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(data/|checkpoints/|outputs/)
+      - id: end-of-file-fixer
+        exclude: ^(data/|checkpoints/|outputs/)
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+        exclude: ^(data/|checkpoints/|outputs/)
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # Black - code formatter
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        language_version: python3
+        exclude: ^(data/|checkpoints/|outputs/)
+
+  # Ruff - fast linter (replaces flake8, isort, etc.)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^(data/|checkpoints/|outputs/)
+
+  # Mypy - type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - numpy
+          - torch
+          - types-PyYAML
+        args: [--config-file=pyproject.toml]
+        exclude: ^(data/|checkpoints/|outputs/|tests/)
+
+# CI configuration (optional - for GitHub Actions)
+ci:
+  autofix_prs: true
+  autoupdate_schedule: monthly

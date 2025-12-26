@@ -1,0 +1,89 @@
+# Generation Configuration
+# Settings for generating new structures
+
+# Model Paths
+models:
+  block2vec: "checkpoints/block2vec/best.pt"
+  vqvae: "checkpoints/vqvae/best.pt"
+  text_encoder: "checkpoints/text_encoder/best.pt"  # Optional
+
+# Generation Settings
+generation:
+  # Output size
+  output_size: [32, 32, 32]  # Generated structure dimensions
+
+  # Temperature for sampling
+  temperature: 1.0         # Higher = more random, lower = more deterministic
+  # 1.0 = normal, 0.5 = more focused, 1.5 = more creative
+
+  # Top-k sampling
+  top_k: 0                 # 0 = disabled, >0 = only sample from top k codes
+  # Limits randomness by only considering top k most likely codes
+
+  # Top-p (nucleus) sampling
+  top_p: 1.0               # 1.0 = disabled, <1.0 = sample from top p probability mass
+  # 0.9 = sample from codes that make up 90% of probability
+
+  # Random code generation
+  random_codes:
+    enabled: true          # Generate from random codebook indices
+    method: "uniform"      # Options: "uniform", "learned_prior"
+    # uniform: Sample codes uniformly at random
+    # learned_prior: Use learned distribution (requires trained prior)
+
+# Text-to-Structure (Phase 4)
+text_generation:
+  enabled: false           # Enable after training text encoder
+  clip_model: "openai/clip-vit-base-patch32"
+  max_text_length: 77      # CLIP's maximum token length
+
+# Interpolation
+interpolation:
+  method: "slerp"          # Options: "linear", "slerp"
+  # linear: Simple linear interpolation
+  # slerp: Spherical linear interpolation (better for high-dim)
+  num_steps: 10            # Number of interpolation steps
+
+# Export Settings
+export:
+  # Schematic format (WorldEdit compatible)
+  schematic:
+    enabled: true
+    output_dir: "outputs/schematics"
+
+  # NBT Structure format (vanilla Minecraft)
+  nbt:
+    enabled: true
+    output_dir: "outputs/nbt"
+    # Also copy to server for immediate use
+    copy_to_server: true
+    server_structures_dir: "../server/world/generated/minecraft/structures"
+
+  # Litematica format (mod)
+  litematic:
+    enabled: false
+    output_dir: "outputs/litematic"
+
+  # mcfunction format (commands)
+  mcfunction:
+    enabled: false
+    output_dir: "outputs/mcfunction"
+    # Large structures split into multiple command blocks
+    max_commands_per_file: 10000
+
+# Visualization
+visualization:
+  enabled: true
+  output_dir: "outputs/visualizations"
+  render_3d: true          # Generate 3D plotly visualization
+  save_slices: true        # Save layer-by-layer PNG slices
+  colormap: "minecraft"    # Options: "minecraft" (actual colors), "category" (by block type)
+
+# Batch Generation
+batch:
+  num_samples: 10          # Number of structures to generate in batch mode
+  naming: "sequential"     # Options: "sequential" (gen_001, gen_002), "uuid", "timestamp"
+
+# Reproducibility
+seed: null                 # null = random, integer = reproducible
+# Set to specific number to reproduce exact same generation
