@@ -113,5 +113,7 @@ Thumbs.db
 *.temp
 *.bak
 
-# Session tracking (changes frequently)
+# Session/context tracking (local only)
 SESSION_STATUS.md
+CLAUDE.md
+DECISIONS.md
