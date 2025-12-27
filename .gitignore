@@ -83,6 +83,7 @@ dmypy.json
 # Data files (large, don't commit)
 data/raw/
 data/processed/
+data/splits/
 data/embeddings/*.npy
 *.schematic
 *.nbt
