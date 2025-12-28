@@ -85,12 +85,18 @@ data/raw/
 data/processed/
 data/splits/
 data/embeddings/*.npy
+
+# Kaggle outputs (large files, but keep notebooks)
+data/kaggle/input/
+data/kaggle/output/
+data/kaggle/logs/
 *.schematic
 *.nbt
 *.litematic
 
-# Checkpoints (large model files)
+# Checkpoints and trained models (large files)
 checkpoints/
+/models/
 *.pt
 *.pth
 *.ckpt
