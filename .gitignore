@@ -90,6 +90,7 @@ data/embeddings/*.npy
 data/kaggle/input/
 data/kaggle/output/
 data/kaggle/logs/
+data/kaggle/plot/
 *.schematic
 *.nbt
 *.litematic
@@ -100,6 +101,9 @@ checkpoints/
 *.pt
 *.pth
 *.ckpt
+
+# Documents
+docs/
 
 # Outputs
 outputs/

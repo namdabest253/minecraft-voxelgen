@@ -12,6 +12,11 @@ Architecture:
         → Vector Quantization (map each position to nearest codebook entry)
         → Decoder CNN (expand back to 32x32x32)
         → Predict block type at each position
+
+Key improvements in this version:
+    - EMA codebook updates (no gradient descent on codebook)
+    - Dead code reset (reinitialize unused codes)
+    - Higher commitment cost for better codebook utilization
 """
 
 import torch
@@ -20,17 +25,213 @@ import torch.nn.functional as F
 from typing import Tuple, Dict, Any
 
 
-class VectorQuantizer(nn.Module):
-    """Vector Quantization layer with straight-through gradient estimator.
+class VectorQuantizerEMA(nn.Module):
+    """Vector Quantization with Exponential Moving Average codebook updates.
 
-    Maintains a codebook of K learnable vectors. Each input vector is
-    replaced with its nearest codebook entry. Gradients flow through
-    using the straight-through estimator.
+    This version uses EMA to update the codebook instead of gradient descent,
+    which helps prevent codebook collapse. Also includes dead code reset.
+
+    The codebook is updated as:
+        N_i = decay * N_i + (1 - decay) * n_i  (count of assignments to code i)
+        m_i = decay * m_i + (1 - decay) * sum(z_e assigned to i)
+        e_i = m_i / N_i  (codebook vector)
 
     Args:
         num_embeddings: Number of codebook entries (K)
         embedding_dim: Dimension of each codebook vector (D)
-        commitment_cost: Weight for commitment loss (β), typically 0.25
+        commitment_cost: Weight for commitment loss (β), typically 0.25-1.0
+        decay: EMA decay rate (0.99 is typical)
+        epsilon: Small constant to avoid division by zero
+        dead_code_threshold: Reset codes used less than this fraction
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int = 512,
+        embedding_dim: int = 256,
+        commitment_cost: float = 0.5,
+        decay: float = 0.99,
+        epsilon: float = 1e-5,
+        dead_code_threshold: float = 0.01,
+    ):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
+        self.dead_code_threshold = dead_code_threshold
+
+        # Codebook embeddings (not learned via gradients)
+        # Shape: [num_embeddings, embedding_dim]
+        self.register_buffer("codebook", torch.randn(num_embeddings, embedding_dim))
+
+        # EMA cluster size (count of assignments to each code)
+        self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
+
+        # EMA sum of encoder outputs assigned to each code
+        self.register_buffer("ema_embed_sum", torch.randn(num_embeddings, embedding_dim))
+
+        # Track if codebook has been initialized from data
+        self.register_buffer("initialized", torch.tensor(False))
+
+        # Track usage for dead code detection
+        self.register_buffer("usage_count", torch.zeros(num_embeddings))
+
+    def _init_codebook(self, flat_z_e: torch.Tensor):
+        """Initialize codebook from first batch of encoder outputs."""
+        # Sample random encoder outputs as initial codebook
+        n_samples = flat_z_e.shape[0]
+        if n_samples >= self.num_embeddings:
+            # Randomly select encoder outputs
+            indices = torch.randperm(n_samples)[:self.num_embeddings]
+            self.codebook.data.copy_(flat_z_e[indices])
+        else:
+            # Not enough samples, use what we have + random
+            self.codebook.data[:n_samples].copy_(flat_z_e)
+
+        # Initialize EMA buffers
+        self.ema_cluster_size.fill_(1.0)
+        self.ema_embed_sum.data.copy_(self.codebook.data)
+        self.initialized.fill_(True)
+
+    def _reset_dead_codes(self, flat_z_e: torch.Tensor, encoding_indices: torch.Tensor):
+        """Reset codebook entries that are rarely used."""
+        # Count usage in this batch
+        batch_usage = torch.bincount(
+            encoding_indices.view(-1),
+            minlength=self.num_embeddings
+        ).float()
+
+        # Update cumulative usage
+        self.usage_count = self.decay * self.usage_count + (1 - self.decay) * batch_usage
+
+        # Find dead codes (used less than threshold)
+        avg_usage = self.usage_count.sum() / self.num_embeddings
+        dead_mask = self.usage_count < (avg_usage * self.dead_code_threshold)
+        n_dead = dead_mask.sum().item()
+
+        if n_dead > 0 and flat_z_e.shape[0] > 0:
+            # Sample random encoder outputs to replace dead codes
+            n_samples = min(int(n_dead), flat_z_e.shape[0])
+            indices = torch.randperm(flat_z_e.shape[0], device=flat_z_e.device)[:n_samples]
+            samples = flat_z_e[indices]
+
+            # Find which codes to reset
+            dead_indices = torch.where(dead_mask)[0][:n_samples]
+
+            # Reset the dead codes
+            self.codebook.data[dead_indices] = samples
+            self.ema_cluster_size[dead_indices] = 1.0
+            self.ema_embed_sum.data[dead_indices] = samples
+            self.usage_count[dead_indices] = avg_usage
+
+        return n_dead
+
+    def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize encoder outputs to nearest codebook entries.
+
+        Args:
+            z_e: Encoder output [batch, channels, depth, height, width]
+                 channels should equal embedding_dim
+
+        Returns:
+            z_q: Quantized output (same shape as z_e)
+            vq_loss: Commitment loss only (codebook updated via EMA)
+            encoding_indices: Which codebook entry was selected [batch, D, H, W]
+        """
+        # z_e shape: [B, C, D, H, W] where C = embedding_dim
+
+        # Reshape to [B*D*H*W, C] for distance calculation
+        z_e_permuted = z_e.permute(0, 2, 3, 4, 1).contiguous()  # [B, D, H, W, C]
+        flat_z_e = z_e_permuted.view(-1, self.embedding_dim)  # [B*D*H*W, C]
+
+        # Initialize codebook from first batch
+        if not self.initialized and self.training:
+            self._init_codebook(flat_z_e)
+
+        # Compute distances to all codebook entries
+        # ||z_e - codebook||² = ||z_e||² + ||codebook||² - 2 * z_e · codebook
+        z_e_sq = (flat_z_e ** 2).sum(dim=1, keepdim=True)  # [N, 1]
+        codebook_sq = (self.codebook ** 2).sum(dim=1, keepdim=True).t()  # [1, K]
+        dot_product = torch.mm(flat_z_e, self.codebook.t())  # [N, K]
+        distances = z_e_sq + codebook_sq - 2 * dot_product  # [N, K]
+
+        # Find nearest codebook entry for each position
+        encoding_indices = distances.argmin(dim=1)  # [N]
+
+        # Look up the codebook vectors
+        z_q_flat = F.embedding(encoding_indices, self.codebook)  # [N, C]
+
+        # === EMA Codebook Update (only during training) ===
+        if self.training:
+            # One-hot encode the assignments
+            encodings = F.one_hot(encoding_indices, self.num_embeddings).float()  # [N, K]
+
+            # Update EMA cluster size
+            batch_cluster_size = encodings.sum(0)  # [K]
+            self.ema_cluster_size.data.mul_(self.decay).add_(
+                batch_cluster_size, alpha=1 - self.decay
+            )
+
+            # Update EMA embedding sum
+            batch_embed_sum = encodings.t() @ flat_z_e  # [K, C]
+            self.ema_embed_sum.data.mul_(self.decay).add_(
+                batch_embed_sum, alpha=1 - self.decay
+            )
+
+            # Laplace smoothing to avoid division by zero
+            n = self.ema_cluster_size.sum()
+            smoothed_cluster_size = (
+                (self.ema_cluster_size + self.epsilon) /
+                (n + self.num_embeddings * self.epsilon) * n
+            )
+
+            # Update codebook
+            self.codebook.data.copy_(
+                self.ema_embed_sum / smoothed_cluster_size.unsqueeze(1)
+            )
+
+            # Reset dead codes periodically
+            self._reset_dead_codes(flat_z_e, encoding_indices)
+
+        # Reshape back to [B, D, H, W, C]
+        z_q_permuted = z_q_flat.view(z_e_permuted.shape)
+
+        # === Commitment Loss ===
+        # Only commitment loss - codebook is updated via EMA, not gradients
+        commitment_loss = F.mse_loss(z_e_permuted, z_q_permuted.detach())
+        vq_loss = self.commitment_cost * commitment_loss
+
+        # === Straight-Through Estimator ===
+        z_q_st = z_e_permuted + (z_q_permuted - z_e_permuted).detach()
+
+        # Permute back to [B, C, D, H, W]
+        z_q = z_q_st.permute(0, 4, 1, 2, 3).contiguous()
+
+        # Reshape encoding indices to spatial grid
+        spatial_shape = z_e_permuted.shape[:-1]  # [B, D, H, W]
+        encoding_indices = encoding_indices.view(spatial_shape)
+
+        return z_q, vq_loss, encoding_indices
+
+    def get_codebook_usage(self) -> Tuple[int, float]:
+        """Get codebook utilization statistics.
+
+        Returns:
+            Tuple of (num_used_codes, usage_fraction)
+        """
+        avg_usage = self.usage_count.sum() / self.num_embeddings
+        used_mask = self.usage_count > (avg_usage * self.dead_code_threshold)
+        num_used = used_mask.sum().item()
+        return int(num_used), num_used / self.num_embeddings
+
+
+# Keep original VectorQuantizer for backwards compatibility
+class VectorQuantizer(nn.Module):
+    """Original Vector Quantization layer (gradient-based, no EMA).
+
+    Kept for backwards compatibility. For new training, use VectorQuantizerEMA.
     """
 
     def __init__(
@@ -43,86 +244,30 @@ class VectorQuantizer(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
-
-        # The codebook: K vectors of dimension D
-        # Shape: [num_embeddings, embedding_dim]
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
-
-        # Initialize codebook with uniform distribution
-        # Range chosen to match typical encoder outputs
         self.codebook.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize encoder outputs to nearest codebook entries.
+        z_e_permuted = z_e.permute(0, 2, 3, 4, 1).contiguous()
+        flat_z_e = z_e_permuted.view(-1, self.embedding_dim)
 
-        Args:
-            z_e: Encoder output [batch, channels, depth, height, width]
-                 channels should equal embedding_dim
-
-        Returns:
-            z_q: Quantized output (same shape as z_e)
-            vq_loss: Codebook + commitment loss
-            encoding_indices: Which codebook entry was selected [batch, D, H, W]
-        """
-        # z_e shape: [B, C, D, H, W] where C = embedding_dim
-        batch_size = z_e.shape[0]
-
-        # Reshape to [B*D*H*W, C] for distance calculation
-        # First permute to [B, D, H, W, C], then flatten
-        z_e_permuted = z_e.permute(0, 2, 3, 4, 1).contiguous()  # [B, D, H, W, C]
-        flat_z_e = z_e_permuted.view(-1, self.embedding_dim)  # [B*D*H*W, C]
-
-        # Compute distances to all codebook entries
-        # ||z_e - codebook||² = ||z_e||² + ||codebook||² - 2 * z_e · codebook
-        # This is more numerically stable than direct distance computation
-
-        # ||z_e||² for each input vector: [B*D*H*W, 1]
         z_e_sq = (flat_z_e ** 2).sum(dim=1, keepdim=True)
-
-        # ||codebook||² for each codebook entry: [1, K]
         codebook_sq = (self.codebook.weight ** 2).sum(dim=1, keepdim=True).t()
-
-        # z_e · codebook: [B*D*H*W, K]
         dot_product = torch.mm(flat_z_e, self.codebook.weight.t())
-
-        # Squared distances: [B*D*H*W, K]
         distances = z_e_sq + codebook_sq - 2 * dot_product
 
-        # Find nearest codebook entry for each position
-        encoding_indices = distances.argmin(dim=1)  # [B*D*H*W]
-
-        # Look up the codebook vectors
-        z_q_flat = self.codebook(encoding_indices)  # [B*D*H*W, C]
-
-        # Reshape back to [B, D, H, W, C]
+        encoding_indices = distances.argmin(dim=1)
+        z_q_flat = self.codebook(encoding_indices)
         z_q_permuted = z_q_flat.view(z_e_permuted.shape)
 
-        # === Compute VQ Loss ===
-        # Codebook loss: move codebook toward encoder outputs
-        # sg[z_e] means stop gradient - treat z_e as constant
         codebook_loss = F.mse_loss(z_q_permuted, z_e_permuted.detach())
-
-        # Commitment loss: move encoder outputs toward codebook
-        # sg[z_q] means stop gradient - treat z_q as constant
         commitment_loss = F.mse_loss(z_e_permuted, z_q_permuted.detach())
-
-        # Total VQ loss
         vq_loss = codebook_loss + self.commitment_cost * commitment_loss
 
-        # === Straight-Through Estimator ===
-        # Forward: use z_q (quantized)
-        # Backward: gradients flow to z_e (as if no quantization happened)
-        #
-        # Math trick: z_q = z_e + (z_q - z_e).detach()
-        # - Forward: z_e + (z_q - z_e) = z_q ✓
-        # - Backward: gradient only flows through z_e ✓
         z_q_st = z_e_permuted + (z_q_permuted - z_e_permuted).detach()
-
-        # Permute back to [B, C, D, H, W]
         z_q = z_q_st.permute(0, 4, 1, 2, 3).contiguous()
 
-        # Reshape encoding indices to spatial grid
-        spatial_shape = z_e_permuted.shape[:-1]  # [B, D, H, W]
+        spatial_shape = z_e_permuted.shape[:-1]
         encoding_indices = encoding_indices.view(spatial_shape)
 
         return z_q, vq_loss, encoding_indices
@@ -287,8 +432,10 @@ class VQVAE(nn.Module):
         hidden_dims: Encoder hidden dimensions [64, 128, 256]
         latent_dim: Codebook embedding dimension (256)
         num_codebook_entries: Number of codebook vectors (512)
-        commitment_cost: VQ commitment loss weight (0.25)
+        commitment_cost: VQ commitment loss weight (0.5 recommended for EMA)
         pretrained_embeddings: Optional pre-trained block embeddings [vocab, embed_dim]
+        use_ema: Use EMA codebook updates (recommended) vs gradient descent
+        ema_decay: EMA decay rate (only used if use_ema=True)
     """
 
     def __init__(
@@ -298,8 +445,10 @@ class VQVAE(nn.Module):
         hidden_dims: list = None,
         latent_dim: int = 256,
         num_codebook_entries: int = 512,
-        commitment_cost: float = 0.25,
+        commitment_cost: float = 0.5,
         pretrained_embeddings: torch.Tensor = None,
+        use_ema: bool = True,
+        ema_decay: float = 0.99,
     ):
         super().__init__()
 
@@ -307,6 +456,7 @@ class VQVAE(nn.Module):
         self.block_embedding_dim = block_embedding_dim
         self.latent_dim = latent_dim
         self.num_codebook_entries = num_codebook_entries
+        self.use_ema = use_ema
 
         # Block embedding layer
         self.block_embeddings = nn.Embedding(vocab_size, block_embedding_dim)
@@ -330,11 +480,20 @@ class VQVAE(nn.Module):
         )
 
         # Vector Quantizer with codebook
-        self.quantizer = VectorQuantizer(
-            num_embeddings=num_codebook_entries,
-            embedding_dim=latent_dim,
-            commitment_cost=commitment_cost,
-        )
+        # Use EMA version by default (prevents codebook collapse)
+        if use_ema:
+            self.quantizer = VectorQuantizerEMA(
+                num_embeddings=num_codebook_entries,
+                embedding_dim=latent_dim,
+                commitment_cost=commitment_cost,
+                decay=ema_decay,
+            )
+        else:
+            self.quantizer = VectorQuantizer(
+                num_embeddings=num_codebook_entries,
+                embedding_dim=latent_dim,
+                commitment_cost=commitment_cost,
+            )
 
         # Decoder: 4³ → 32³
         self.decoder = Decoder(
@@ -419,20 +578,32 @@ class VQVAE(nn.Module):
     def compute_loss(
         self,
         block_ids: torch.Tensor,
-        ignore_index: int = 0,
+        air_index: int = 0,
+        structure_weight: float = 10.0,
+        use_focal: bool = False,
+        focal_gamma: float = 2.0,
     ) -> Dict[str, torch.Tensor]:
-        """Compute training loss.
+        """Compute training loss with class imbalance handling.
+
+        To combat the air block dominance (~90% of voxels), we:
+        1. Weight non-air blocks higher in the loss
+        2. Optionally use focal loss to focus on hard examples
 
         Args:
             block_ids: Ground truth block IDs [batch, 32, 32, 32]
-            ignore_index: Block ID to ignore in loss (typically air=0)
+            air_index: Block ID for air (typically 0)
+            structure_weight: Weight multiplier for non-air blocks (default 10x)
+            use_focal: Use focal loss for hard example mining
+            focal_gamma: Focal loss focusing parameter (higher = more focus on hard)
 
         Returns:
             Dictionary with:
                 - loss: Total loss
                 - reconstruction_loss: Cross-entropy for block prediction
                 - vq_loss: Vector quantization loss
-                - accuracy: Block prediction accuracy
+                - accuracy: Block prediction accuracy (on non-air blocks)
+                - air_accuracy: Accuracy on air blocks
+                - structure_accuracy: Accuracy on non-air blocks
         """
         outputs = self(block_ids)
 
@@ -444,29 +615,56 @@ class VQVAE(nn.Module):
         logits_flat = logits.view(-1, self.vocab_size)  # [B*32*32*32, vocab_size]
         targets_flat = block_ids.view(-1)  # [B*32*32*32]
 
-        # Cross-entropy loss (ignoring air blocks if specified)
-        reconstruction_loss = F.cross_entropy(
-            logits_flat,
-            targets_flat,
-            ignore_index=ignore_index,
-        )
+        # Create weight mask: higher weight for non-air blocks
+        is_structure = (targets_flat != air_index).float()
+        weights = torch.ones_like(is_structure)
+        weights = weights + is_structure * (structure_weight - 1)  # air=1, structure=structure_weight
+
+        if use_focal:
+            # Focal loss: -alpha * (1-p)^gamma * log(p)
+            # Reduces loss for well-classified examples, focuses on hard ones
+            ce_loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+            probs = F.softmax(logits_flat, dim=1)
+            pt = probs.gather(1, targets_flat.unsqueeze(1)).squeeze()
+            focal_weight = (1 - pt) ** focal_gamma
+            reconstruction_loss = (focal_weight * weights * ce_loss).mean()
+        else:
+            # Weighted cross-entropy
+            ce_loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+            reconstruction_loss = (weights * ce_loss).mean()
 
         # Total loss
         total_loss = reconstruction_loss + outputs["vq_loss"]
 
-        # Compute accuracy (excluding ignored blocks)
+        # Compute detailed accuracy metrics
         with torch.no_grad():
             predictions = logits_flat.argmax(dim=1)
-            mask = targets_flat != ignore_index
-            correct = (predictions[mask] == targets_flat[mask]).float().sum()
-            total = mask.sum()
-            accuracy = correct / total if total > 0 else torch.tensor(0.0)
+
+            # Overall accuracy
+            correct = (predictions == targets_flat).float()
+            accuracy = correct.mean()
+
+            # Air block accuracy
+            air_mask = targets_flat == air_index
+            if air_mask.sum() > 0:
+                air_accuracy = correct[air_mask].mean()
+            else:
+                air_accuracy = torch.tensor(0.0, device=block_ids.device)
+
+            # Structure (non-air) accuracy
+            structure_mask = ~air_mask
+            if structure_mask.sum() > 0:
+                structure_accuracy = correct[structure_mask].mean()
+            else:
+                structure_accuracy = torch.tensor(0.0, device=block_ids.device)
 
         return {
             "loss": total_loss,
             "reconstruction_loss": reconstruction_loss,
             "vq_loss": outputs["vq_loss"],
             "accuracy": accuracy,
+            "air_accuracy": air_accuracy,
+            "structure_accuracy": structure_accuracy,
         }
 
     @torch.no_grad()
@@ -493,8 +691,14 @@ class VQVAE(nn.Module):
         Returns:
             Predicted block IDs [batch, 32, 32, 32]
         """
-        # Look up codebook vectors
-        z_q = self.quantizer.codebook(indices)  # [B, D, H, W, latent_dim]
+        # Look up codebook vectors - handle both EMA and non-EMA quantizers
+        if self.use_ema:
+            # EMA quantizer stores codebook as buffer
+            z_q = F.embedding(indices, self.quantizer.codebook)  # [B, D, H, W, latent_dim]
+        else:
+            # Original quantizer uses nn.Embedding
+            z_q = self.quantizer.codebook(indices)  # [B, D, H, W, latent_dim]
+
         z_q = z_q.permute(0, 4, 1, 2, 3).contiguous()  # [B, latent_dim, D, H, W]
 
         # Decode to block logits
