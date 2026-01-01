@@ -85,12 +85,13 @@ data/raw/
 data/processed/
 data/splits/
 data/embeddings/*.npy
+schematic_tests/
 
 # Kaggle outputs (large files, but keep notebooks)
 data/kaggle/input/
-data/kaggle/output/
 data/kaggle/logs/
 data/kaggle/plot/
+data/output/
 *.schematic
 *.nbt
 *.litematic
