@@ -1650,3 +1650,347 @@ class VQVAEv4(nn.Module):
         indices_flat = indices.view(-1)
         usage = torch.bincount(indices_flat, minlength=self.num_codebook_entries)
         return usage
+
+
+# =============================================================================
+# VQ-VAE v8-B: 16x16x16 Latent Resolution Upgrade
+# =============================================================================
+
+
+class EncoderV8B(nn.Module):
+    """3D CNN Encoder for VQ-VAE v8-B: 32x32x32 → 16x16x16 latent.
+
+    Key changes from v6:
+        - Single downsampling stage (32→16) instead of two (32→16→8)
+        - 8x more spatial positions (4,096 vs 512)
+        - Reduces compression from 64:1 to 8:1
+        - 6 ResBlocks at latent resolution for capacity
+
+    Architecture:
+        32x32x32 → Conv4/2 → 16x16x16 → ResBlocks → 16x16x16
+
+    Args:
+        in_channels: Input channels (block embedding dim, typically 40)
+        hidden_dim: Single hidden dimension throughout (192)
+        rfsq_dim: Output dimension for RFSQ (4)
+        num_resblocks_per_stage: ResBlocks after downsampling (2)
+        num_resblocks_latent: ResBlocks at latent resolution (6)
+        dropout: Dropout rate for regularization (0.1)
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 40,
+        hidden_dim: int = 192,
+        rfsq_dim: int = 4,
+        num_resblocks_per_stage: int = 2,
+        num_resblocks_latent: int = 6,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # Initial projection
+        self.initial = nn.Sequential(
+            nn.Conv3d(in_channels, hidden_dim, 3, padding=1),
+            nn.BatchNorm3d(hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        # Downsampling stage: 32 → 16
+        self.downsample = nn.Sequential(
+            nn.Conv3d(hidden_dim, hidden_dim, 4, stride=2, padding=1),
+            nn.BatchNorm3d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout)
+        )
+
+        # ResBlocks after downsampling
+        self.stage_blocks = nn.Sequential(*[
+            ResidualBlock3D(hidden_dim, hidden_dim)
+            for _ in range(num_resblocks_per_stage)
+        ])
+
+        # ResBlocks at latent resolution (16×16×16)
+        self.latent_blocks = nn.Sequential(*[
+            ResidualBlock3D(hidden_dim, hidden_dim)
+            for _ in range(num_resblocks_latent)
+        ])
+
+        # Final projection to RFSQ dimension
+        self.latent_proj = nn.Conv3d(hidden_dim, rfsq_dim, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode input to latent representation.
+
+        Args:
+            x: Input tensor [batch, channels, 32, 32, 32]
+
+        Returns:
+            Latent tensor [batch, rfsq_dim, 16, 16, 16]
+        """
+        x = self.initial(x)           # [B, 192, 32, 32, 32]
+        x = self.downsample(x)         # [B, 192, 16, 16, 16]
+        x = self.stage_blocks(x)       # [B, 192, 16, 16, 16]
+        x = self.latent_blocks(x)      # [B, 192, 16, 16, 16]
+        z_e = self.latent_proj(x)      # [B, 4, 16, 16, 16]
+        return z_e
+
+
+class DecoderV8B(nn.Module):
+    """3D CNN Decoder for VQ-VAE v8-B: 16x16x16 latent → 32x32x32 output.
+
+    Key changes from v6:
+        - Single upsampling stage (16→32) instead of two (8→16→32)
+        - Mirror of encoder architecture
+        - 6 ResBlocks at latent resolution
+
+    Architecture:
+        16x16x16 → ResBlocks → ConvT4/2 → 32x32x32 → Predict blocks
+
+    Args:
+        rfsq_dim: Input dimension from RFSQ (4)
+        hidden_dim: Single hidden dimension throughout (192)
+        num_blocks: Number of block types to predict (3717)
+        num_resblocks_per_stage: ResBlocks before upsampling (2)
+        num_resblocks_latent: ResBlocks at latent resolution (6)
+        dropout: Dropout rate for regularization (0.1)
+    """
+
+    def __init__(
+        self,
+        rfsq_dim: int = 4,
+        hidden_dim: int = 192,
+        num_blocks: int = 3717,
+        num_resblocks_per_stage: int = 2,
+        num_resblocks_latent: int = 6,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # Initial projection from RFSQ
+        self.initial = nn.Sequential(
+            nn.Conv3d(rfsq_dim, hidden_dim, 3, padding=1),
+            nn.BatchNorm3d(hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        # ResBlocks at latent resolution
+        self.latent_blocks = nn.Sequential(*[
+            ResidualBlock3D(hidden_dim, hidden_dim)
+            for _ in range(num_resblocks_latent)
+        ])
+
+        # ResBlocks before upsampling
+        self.stage_blocks = nn.Sequential(*[
+            ResidualBlock3D(hidden_dim, hidden_dim)
+            for _ in range(num_resblocks_per_stage)
+        ])
+
+        # Upsampling stage: 16 → 32
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose3d(hidden_dim, hidden_dim, 4, stride=2, padding=1),
+            nn.BatchNorm3d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(dropout)
+        )
+
+        # Final prediction head
+        self.final = nn.Conv3d(hidden_dim, num_blocks, 3, padding=1)
+
+    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
+        """Decode latent representation to block predictions.
+
+        Args:
+            z_q: Quantized latent [batch, rfsq_dim, 16, 16, 16]
+
+        Returns:
+            Block logits [batch, num_blocks, 32, 32, 32]
+        """
+        x = self.initial(z_q)          # [B, 192, 16, 16, 16]
+        x = self.latent_blocks(x)      # [B, 192, 16, 16, 16]
+        x = self.stage_blocks(x)       # [B, 192, 16, 16, 16]
+        x = self.upsample(x)           # [B, 192, 32, 32, 32]
+        logits = self.final(x)         # [B, 3717, 32, 32, 32]
+        return logits
+
+
+class VQVAEv8B(nn.Module):
+    """VQ-VAE v8-B with 16×16×16 latent resolution for better generation.
+
+    This version increases latent resolution from 8³ to 16³, providing 8x more
+    spatial positions to preserve structural detail. Maintains pure latent-only
+    architecture (NO skip connections) to ensure generation capability.
+
+    Key improvements over v6-freq:
+        1. 16×16×16 latent grid (4,096 positions vs 512)
+        2. 8:1 compression (32³→16³) vs 64:1 (32³→8³)
+        3. More ResBlocks at latent resolution (6 vs 2)
+        4. Volume penalty loss (fixes 1.68x over-prediction)
+        5. Perceptual loss (spatial smoothness in latent)
+
+    Target: 60-65% building accuracy (vs v6-freq's 49.2%)
+
+    Args:
+        vocab_size: Number of block types (3717)
+        emb_dim: Block embedding dimension (40)
+        hidden_dim: Encoder/decoder hidden dimension (192)
+        rfsq_levels: RFSQ quantization levels per dimension ([5,5,5,5])
+        num_stages: Number of RFSQ stages (2)
+        dropout: Dropout rate (0.1)
+        pretrained_embeddings: Optional pre-trained block embeddings
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = 3717,
+        emb_dim: int = 40,
+        hidden_dim: int = 192,
+        rfsq_levels: list = None,
+        num_stages: int = 2,
+        dropout: float = 0.1,
+        pretrained_embeddings: torch.Tensor = None,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.emb_dim = emb_dim
+        self.hidden_dim = hidden_dim
+
+        if rfsq_levels is None:
+            rfsq_levels = [5, 5, 5, 5]  # 4 dims, 5 levels each
+
+        self.rfsq_dim = len(rfsq_levels)
+
+        # Block embedding layer
+        self.block_emb = nn.Embedding(vocab_size, emb_dim)
+
+        # Load pretrained embeddings if provided
+        if pretrained_embeddings is not None:
+            assert pretrained_embeddings.shape == (vocab_size, emb_dim), \
+                f"Expected shape ({vocab_size}, {emb_dim}), got {pretrained_embeddings.shape}"
+            self.block_emb.weight.data.copy_(pretrained_embeddings)
+            # Freeze embeddings - they're already trained
+            self.block_emb.weight.requires_grad = False
+
+        # Encoder: 32³ → 16³
+        self.encoder = EncoderV8B(
+            in_channels=emb_dim,
+            hidden_dim=hidden_dim,
+            rfsq_dim=self.rfsq_dim,
+            dropout=dropout,
+        )
+
+        # RFSQ quantizer (import needed at top of file)
+        from .rfsq import RFSQ
+        self.quantizer = RFSQ(
+            levels_per_stage=rfsq_levels,
+            num_stages=num_stages,
+        )
+
+        # Decoder: 16³ → 32³
+        self.decoder = DecoderV8B(
+            rfsq_dim=self.rfsq_dim,
+            hidden_dim=hidden_dim,
+            num_blocks=vocab_size,
+            dropout=dropout,
+        )
+
+    def encode(self, block_ids: torch.Tensor) -> torch.Tensor:
+        """Encode block structure to continuous latent representation.
+
+        Args:
+            block_ids: Block token IDs [batch, 32, 32, 32]
+
+        Returns:
+            Encoder output [batch, rfsq_dim, 16, 16, 16]
+        """
+        # Embed blocks: [B, 32, 32, 32] → [B, 32, 32, 32, emb_dim]
+        embedded = self.block_emb(block_ids)
+
+        # Permute to channel-first: [B, emb_dim, 32, 32, 32]
+        embedded = embedded.permute(0, 4, 1, 2, 3).contiguous()
+
+        # Encode
+        return self.encoder(embedded)
+
+    def quantize(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize encoder output using RFSQ.
+
+        Args:
+            z_e: Encoder output [batch, rfsq_dim, 16, 16, 16]
+
+        Returns:
+            z_q: Quantized latent (same shape)
+            indices: Codebook indices [batch, 16, 16, 16, rfsq_dim]
+        """
+        return self.quantizer(z_e)
+
+    def decode(self, z_q: torch.Tensor) -> torch.Tensor:
+        """Decode quantized latent to block predictions.
+
+        Args:
+            z_q: Quantized latent [batch, rfsq_dim, 16, 16, 16]
+
+        Returns:
+            Block logits [batch, vocab_size, 32, 32, 32]
+        """
+        return self.decoder(z_q)
+
+    def forward(self, block_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full forward pass.
+
+        Args:
+            block_ids: Block token IDs [batch, 32, 32, 32]
+
+        Returns:
+            Tuple of (logits, z_q, indices):
+                - logits: Block predictions [batch, vocab_size, 32, 32, 32]
+                - z_q: Quantized latent [batch, rfsq_dim, 16, 16, 16]
+                - indices: Codebook indices [batch, 16, 16, 16, rfsq_dim]
+        """
+        # Encode
+        z_e = self.encode(block_ids)
+
+        # Quantize (RFSQ doesn't return a loss, just z_q and indices)
+        z_q, indices = self.quantize(z_e)
+
+        # Decode
+        logits = self.decode(z_q)
+
+        return logits, z_q, indices
+
+    @torch.no_grad()
+    def encode_structure(self, block_ids: torch.Tensor) -> torch.Tensor:
+        """Encode a structure to codebook indices (for generation).
+
+        Args:
+            block_ids: Block token IDs [batch, 32, 32, 32]
+
+        Returns:
+            Codebook indices [batch, 16, 16, 16, rfsq_dim]
+        """
+        z_e = self.encode(block_ids)
+        _, indices = self.quantize(z_e)
+        return indices
+
+    @torch.no_grad()
+    def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Decode codebook indices to block predictions (for generation).
+
+        Args:
+            indices: Codebook indices [batch, 16, 16, 16, rfsq_dim]
+
+        Returns:
+            Predicted block IDs [batch, 32, 32, 32]
+        """
+        # Dequantize indices to get z_q
+        # RFSQ's decode method handles this
+        z_q = self.quantizer.decode(indices)
+
+        # Decode to block logits
+        logits = self.decode(z_q)
+
+        # Get predicted block IDs
+        block_ids = logits.argmax(dim=1)
+
+        return block_ids
