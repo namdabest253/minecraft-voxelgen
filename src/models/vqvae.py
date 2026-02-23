@@ -444,6 +444,8 @@ class DecoderV4(nn.Module):
         hidden_dims: Hidden layer dimensions [192, 96] (reversed from encoder)
         num_blocks: Number of block types to predict
         dropout: Dropout rate for regularization
+        air_tokens: Set of air token IDs for bias initialization (v11 feature)
+        air_logit_bias: Initial bias for air tokens (negative discourages air). Default: 0.0
     """
 
     def __init__(
@@ -452,6 +454,8 @@ class DecoderV4(nn.Module):
         hidden_dims: list = None,
         num_blocks: int = 3717,
         dropout: float = 0.1,
+        air_tokens: set = None,
+        air_logit_bias: float = 0.0,
     ):
         super().__init__()
 
@@ -482,11 +486,19 @@ class DecoderV4(nn.Module):
             ])
             current_channels = hidden_dim
 
-        # Final prediction layer
-        # Outputs logits for each block type at each position
-        layers.append(nn.Conv3d(current_channels, num_blocks, kernel_size=3, padding=1))
+        self.features = nn.Sequential(*layers)
 
-        self.decoder = nn.Sequential(*layers)
+        # Final prediction layer (separate for bias initialization)
+        # Outputs logits for each block type at each position
+        self.final = nn.Conv3d(current_channels, num_blocks, kernel_size=3, padding=1)
+
+        # v11 feature: Initialize air token biases to discourage air predictions
+        # This helps fix the volume ratio under-prediction from v10
+        if air_tokens and air_logit_bias != 0.0:
+            with torch.no_grad():
+                for token in air_tokens:
+                    if token < num_blocks:
+                        self.final.bias.data[token] = air_logit_bias
 
     def forward(self, z_q: torch.Tensor) -> torch.Tensor:
         """Decode latent representation to block predictions.
@@ -497,7 +509,8 @@ class DecoderV4(nn.Module):
         Returns:
             Block logits [batch, num_blocks, 32, 32, 32]
         """
-        return self.decoder(z_q)
+        x = self.features(z_q)
+        return self.final(x)
 
 
 class Decoder(nn.Module):

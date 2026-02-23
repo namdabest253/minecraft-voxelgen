@@ -2,14 +2,18 @@
 
 This module contains custom loss functions for Minecraft structure generation
 with VQ-VAE models, including frequency-weighted losses, volume penalties,
-and perceptual losses.
+perceptual losses, and generative losses (adversarial + structural).
 """
 
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from .discriminator import StructureDiscriminator3D
+    from .structural_losses import StructuralCoherenceLoss
 
 
 class FrequencyWeightedLoss(nn.Module):
@@ -352,3 +356,496 @@ def compute_frequency_weights(
     weights = (total.float() / counts.float()) ** smoothing
 
     return weights
+
+
+class V11Loss(nn.Module):
+    """Asymmetric loss for v11 that heavily penalizes structure erasure.
+
+    Designed to fix v10's volume ratio (0.633x) and recall (62.82%) issues.
+    Both problems stem from the model predicting too much air and erasing
+    37% of actual structures.
+
+    Key innovations:
+    1. Asymmetric per-voxel weighting: 20x penalty for structure→air errors
+    2. Soft volume penalty: Differentiable through softmax (unlike VolumeHead)
+    3. Explicit false air penalty: Margin-based logit control
+
+    Args:
+        air_tokens: Set of token IDs representing air blocks.
+            Default: {102, 576, 3352} (air, cave_air, void_air)
+        gamma: Focal loss gamma parameter. Default: 2.0
+        structure_to_air_weight: Penalty multiplier for erasing structures. Default: 20.0
+        air_to_structure_weight: Penalty for hallucinating blocks. Default: 1.0
+        false_air_penalty_weight: Weight for logit-level false air penalty. Default: 10.0
+        soft_volume_weight: Weight for soft volume L1 penalty. Default: 5.0
+        frequency_weights: Optional frequency weights for CE loss.
+        frequency_cap: Cap for frequency weights. Default: 5.0
+
+    Example:
+        >>> criterion = V11Loss(
+        ...     air_tokens={102, 576, 3352},
+        ...     structure_to_air_weight=20.0,
+        ...     false_air_penalty_weight=10.0,
+        ...     soft_volume_weight=5.0,
+        ... )
+        >>> loss_dict = criterion(logits, target)
+        >>> loss_dict['loss'].backward()
+    """
+
+    def __init__(
+        self,
+        air_tokens: Optional[Set[int]] = None,
+        gamma: float = 2.0,
+        structure_to_air_weight: float = 20.0,
+        air_to_structure_weight: float = 1.0,
+        false_air_penalty_weight: float = 10.0,
+        soft_volume_weight: float = 5.0,
+        frequency_weights: Optional[torch.Tensor] = None,
+        frequency_cap: float = 5.0,
+    ):
+        super().__init__()
+
+        # Air tokens (minecraft:air, minecraft:cave_air, minecraft:void_air)
+        if air_tokens is None:
+            air_tokens = {102, 576, 3352}
+        self.air_tokens = list(air_tokens)
+
+        self.gamma = gamma
+        self.structure_to_air_weight = structure_to_air_weight
+        self.air_to_structure_weight = air_to_structure_weight
+        self.false_air_penalty_weight = false_air_penalty_weight
+        self.soft_volume_weight = soft_volume_weight
+
+        # Optional frequency weights
+        if frequency_weights is not None:
+            clamped = frequency_weights.clamp(max=frequency_cap)
+            self.register_buffer('freq_weights', clamped)
+        else:
+            self.freq_weights = None
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute asymmetric loss with structure protection.
+
+        Args:
+            logits: Predicted logits [B, vocab_size, H, W, D]
+            target: Ground truth block IDs [B, H, W, D]
+
+        Returns:
+            Dictionary with loss components and metrics
+        """
+        device = logits.device
+        B, C, X, Y, Z = logits.shape
+        total_voxels = X * Y * Z
+
+        # Create air token tensor
+        air_tensor = torch.tensor(self.air_tokens, device=device, dtype=target.dtype)
+
+        # Ground truth masks
+        gt_is_air = torch.isin(target, air_tensor)
+        gt_is_struct = ~gt_is_air
+
+        # Flatten for processing
+        logits_flat = logits.permute(0, 2, 3, 4, 1).reshape(-1, C)  # [N, C]
+        target_flat = target.reshape(-1)  # [N]
+        gt_is_struct_flat = gt_is_struct.reshape(-1)  # [N]
+        gt_is_air_flat = gt_is_air.reshape(-1)  # [N]
+
+        # Get predictions for weight computation
+        pred = logits_flat.argmax(dim=1)  # [N]
+        pred_is_air = torch.isin(pred, air_tensor)
+        pred_is_struct = ~pred_is_air
+
+        # === 1. Asymmetric Weighted Focal Cross-Entropy ===
+        # Create per-voxel weights based on error type
+        weights = torch.ones(logits_flat.shape[0], device=device, dtype=torch.float)
+
+        # HEAVY penalty: structure in GT, predicted as air (ERASURE)
+        # This is the critical error type that v10 made too often
+        struct_to_air_mask = gt_is_struct_flat & pred_is_air
+        weights[struct_to_air_mask] = self.structure_to_air_weight
+
+        # Normal penalty: air in GT, predicted as structure (HALLUCINATION)
+        air_to_struct_mask = gt_is_air_flat & pred_is_struct
+        weights[air_to_struct_mask] = self.air_to_structure_weight
+
+        # Compute focal cross-entropy
+        log_probs = F.log_softmax(logits_flat, dim=1)
+        probs = torch.exp(log_probs)
+        p_t = probs.gather(1, target_flat.unsqueeze(1)).squeeze(1)  # [N]
+        focal_weight = (1 - p_t) ** self.gamma  # [N]
+
+        # Per-sample CE loss
+        if self.freq_weights is not None:
+            ce_per_sample = F.cross_entropy(
+                logits_flat, target_flat,
+                weight=self.freq_weights, reduction='none'
+            )
+        else:
+            ce_per_sample = F.cross_entropy(
+                logits_flat, target_flat, reduction='none'
+            )
+
+        # Combined weighted focal loss
+        weighted_focal_loss = (focal_weight * weights * ce_per_sample).mean()
+
+        # === 2. False Air Penalty (Logit-Level) ===
+        # At GT structure locations, penalize if air logits > non-air logits
+        if gt_is_struct_flat.any():
+            struct_logits = logits_flat[gt_is_struct_flat]  # [N_struct, C]
+
+            # Create air mask for vocab
+            air_mask = torch.zeros(C, device=device, dtype=torch.bool)
+            for t in self.air_tokens:
+                if t < C:
+                    air_mask[t] = True
+
+            # Get max air logit at each structure location
+            if air_mask.any():
+                air_logits_at_struct = struct_logits[:, air_mask].max(dim=1)[0]  # [N_struct]
+            else:
+                air_logits_at_struct = torch.zeros(struct_logits.shape[0], device=device)
+
+            # Get max non-air logit at each structure location
+            non_air_logits = struct_logits.clone()
+            non_air_logits[:, air_mask] = float('-inf')
+            max_non_air = non_air_logits.max(dim=1)[0]  # [N_struct]
+
+            # Penalize when air logit > non-air logit (margin = 1.0)
+            margin = 1.0
+            violation = F.relu(air_logits_at_struct - max_non_air + margin)
+            false_air_penalty = violation.mean()
+        else:
+            false_air_penalty = torch.tensor(0.0, device=device)
+
+        # === 3. Soft Volume Penalty (Differentiable through softmax) ===
+        # Unlike v10's VolumeHead, gradients flow through the decoder
+        probs_full = F.softmax(logits_flat, dim=1)  # [N, C]
+
+        # Sum probabilities of non-air tokens = soft predicted volume
+        air_mask_full = torch.zeros(C, device=device, dtype=torch.bool)
+        for t in self.air_tokens:
+            if t < C:
+                air_mask_full[t] = True
+
+        # Set air probs to 0, sum the rest = soft structure probability
+        non_air_probs = probs_full.clone()
+        non_air_probs[:, air_mask_full] = 0
+        soft_pred_volume = non_air_probs.sum(dim=1).mean()  # Per-voxel average
+
+        # GT volume (normalized)
+        gt_volume = gt_is_struct_flat.float().mean()
+
+        # L1 penalty on volume deviation
+        soft_volume_loss = torch.abs(soft_pred_volume - gt_volume)
+
+        # === Total Loss ===
+        total_loss = (
+            weighted_focal_loss +
+            self.false_air_penalty_weight * false_air_penalty +
+            self.soft_volume_weight * soft_volume_loss
+        )
+
+        # === Metrics (detached for logging) ===
+        with torch.no_grad():
+            correct = (pred == target_flat)
+            accuracy = correct.float().mean()
+
+            # Building accuracy (only on GT structure voxels)
+            if gt_is_struct_flat.any():
+                building_acc = correct[gt_is_struct_flat].float().mean()
+            else:
+                building_acc = torch.tensor(0.0, device=device)
+
+            # Air accuracy
+            if gt_is_air_flat.any():
+                air_acc = correct[gt_is_air_flat].float().mean()
+            else:
+                air_acc = torch.tensor(0.0, device=device)
+
+            # Recall = (structure preserved) / (total GT structure)
+            if gt_is_struct_flat.any():
+                recall = pred_is_struct[gt_is_struct_flat].float().mean()
+            else:
+                recall = torch.tensor(0.0, device=device)
+
+            # False air rate = (GT struct predicted as air) / (total GT struct)
+            if gt_is_struct_flat.any():
+                false_air_rate = pred_is_air[gt_is_struct_flat].float().mean()
+            else:
+                false_air_rate = torch.tensor(0.0, device=device)
+
+            # Hard volume ratio
+            pred_volume = pred_is_struct.float().sum()
+            gt_volume_hard = gt_is_struct_flat.float().sum()
+            volume_ratio = pred_volume / (gt_volume_hard + 1e-6)
+
+            # Precision = (correct struct predictions) / (total struct predictions)
+            if pred_is_struct.any():
+                precision = correct[pred_is_struct & gt_is_struct_flat].sum().float() / pred_is_struct.sum()
+            else:
+                precision = torch.tensor(0.0, device=device)
+
+        return {
+            'loss': total_loss,
+            'focal_loss': weighted_focal_loss.detach(),
+            'false_air_penalty': false_air_penalty.detach(),
+            'soft_volume_loss': soft_volume_loss.detach(),
+            'soft_pred_volume': soft_pred_volume.detach(),
+            'gt_volume': gt_volume.detach(),
+            'volume_ratio': volume_ratio,
+            'accuracy': accuracy,
+            'building_acc': building_acc,
+            'air_acc': air_acc,
+            'recall': recall,
+            'false_air_rate': false_air_rate,
+            'precision': precision,
+        }
+
+
+class GenerativeLoss(nn.Module):
+    """Combined loss for VQ-VAE training with generative quality.
+
+    Combines reconstruction losses with:
+    1. Structural coherence losses (connectivity, patch consistency, smoothness, support)
+    2. Adversarial loss from 3D PatchGAN discriminator
+
+    This loss function teaches the model not just to reconstruct, but to generate
+    structures that "look like real Minecraft builds" without requiring labels.
+
+    Args:
+        frequency_weights: Tensor of shape [vocab_size] with frequency weights.
+        discriminator: Optional 3D PatchGAN discriminator for adversarial training.
+        block_embeddings: [vocab_size, embed_dim] Block2Vec embeddings for smoothness loss.
+        lambda_adv: Weight for adversarial loss. Default: 0.1 (increase over training)
+        lambda_connectivity: Weight for connectivity loss. Default: 0.5
+        lambda_patch: Weight for patch consistency loss. Default: 0.3
+        lambda_smooth: Weight for surface smoothness loss. Default: 0.1
+        lambda_support: Weight for support/gravity loss. Default: 0.2
+        frequency_cap: Maximum frequency weight. Default: 5.0
+        volume_penalty_weight: Weight for volume penalty. Default: 10.0
+        false_air_penalty_weight: Weight for false air penalty. Default: 5.0
+        perceptual_weight: Weight for latent perceptual loss. Default: 0.1
+        air_tokens: Set of token IDs for air blocks. Default: {102, 576, 3352}
+    """
+
+    def __init__(
+        self,
+        frequency_weights: torch.Tensor,
+        discriminator: Optional[nn.Module] = None,
+        block_embeddings: Optional[torch.Tensor] = None,
+        lambda_adv: float = 0.1,
+        lambda_connectivity: float = 0.5,
+        lambda_patch: float = 0.3,
+        lambda_smooth: float = 0.1,
+        lambda_support: float = 0.2,
+        frequency_cap: float = 5.0,
+        volume_penalty_weight: float = 10.0,
+        false_air_penalty_weight: float = 5.0,
+        perceptual_weight: float = 0.1,
+        air_tokens: Optional[Set[int]] = None,
+    ):
+        super().__init__()
+
+        # Store discriminator reference (not as submodule to avoid double optimization)
+        self.discriminator = discriminator
+
+        # Loss weights
+        self.lambda_adv = lambda_adv
+        self.lambda_connectivity = lambda_connectivity
+        self.lambda_patch = lambda_patch
+        self.lambda_smooth = lambda_smooth
+        self.lambda_support = lambda_support
+        self.volume_penalty_weight = volume_penalty_weight
+        self.false_air_penalty_weight = false_air_penalty_weight
+        self.perceptual_weight = perceptual_weight
+
+        # Clamp and store frequency weights
+        clamped_weights = frequency_weights.clamp(max=frequency_cap)
+        self.register_buffer('freq_weights', clamped_weights)
+
+        # Store block embeddings for smoothness loss
+        if block_embeddings is not None:
+            self.register_buffer('block_embeddings', block_embeddings)
+        else:
+            self.block_embeddings = None
+
+        # Air tokens
+        if air_tokens is None:
+            air_tokens = {102, 576, 3352}
+        self.air_tokens = air_tokens
+
+        # Import structural losses (lazy to avoid circular imports)
+        from .structural_losses import (
+            ConnectivityLoss,
+            PatchConsistencyLoss,
+            SurfaceSmoothnessLoss,
+            SupportLoss,
+        )
+
+        self.connectivity_loss = ConnectivityLoss(air_tokens=air_tokens)
+        self.patch_loss = PatchConsistencyLoss(air_tokens=air_tokens)
+        self.smooth_loss = SurfaceSmoothnessLoss(block_embeddings=block_embeddings)
+        self.support_loss = SupportLoss(air_tokens=air_tokens)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        z_q: torch.Tensor,
+        compute_adversarial: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute combined generative loss.
+
+        Args:
+            logits: Predicted logits [B, vocab_size, H, W, D]
+            target: Ground truth block IDs [B, H, W, D]
+            z_q: Quantized latent codes [B, C, H_latent, W_latent, D_latent]
+            compute_adversarial: Whether to compute adversarial loss.
+                Set to False during discriminator update. Default: True
+
+        Returns:
+            Dictionary with all loss components and metrics.
+        """
+        device = logits.device
+        B = logits.shape[0]
+
+        # Get predictions
+        reconstructed = logits.argmax(dim=1)  # [B, H, W, D]
+
+        # === 1. Reconstruction losses (from FrequencyWeightedLoss) ===
+        vocab_size = logits.shape[1]
+        logits_flat = logits.permute(0, 2, 3, 4, 1).reshape(-1, vocab_size)
+        target_flat = target.reshape(-1)
+
+        ce_loss = F.cross_entropy(
+            logits_flat,
+            target_flat,
+            weight=self.freq_weights,
+            reduction='mean'
+        )
+
+        # Volume and false air penalties
+        air_tokens_tensor = torch.tensor(
+            list(self.air_tokens), device=device, dtype=target.dtype
+        )
+        gt_is_air = torch.isin(target, air_tokens_tensor)
+        gt_is_structure = ~gt_is_air
+
+        # Create air mask for logits
+        air_mask = torch.zeros(vocab_size, device=device, dtype=torch.bool)
+        for t in self.air_tokens:
+            if t < vocab_size:
+                air_mask[t] = True
+
+        # Max air and non-air logits per voxel
+        air_logits_list = [logits[:, t, :, :, :] for t in self.air_tokens if t < vocab_size]
+        if air_logits_list:
+            air_logits = torch.stack(air_logits_list, dim=0)
+            max_air_logit = air_logits.max(dim=0)[0]
+        else:
+            max_air_logit = torch.zeros_like(logits[:, 0, :, :, :])
+
+        logits_non_air = logits.clone()
+        logits_non_air[:, air_mask, :, :, :] = float('-inf')
+        max_non_air_logit = logits_non_air.max(dim=1)[0]
+
+        # Volume loss: penalize non-air predictions at air locations
+        if gt_is_air.any():
+            margin = 1.0
+            violation = F.relu(max_non_air_logit[gt_is_air] - max_air_logit[gt_is_air] + margin)
+            volume_loss = violation.mean()
+        else:
+            volume_loss = torch.tensor(0.0, device=device)
+
+        # False air loss: penalize air predictions at structure locations
+        if gt_is_structure.any():
+            margin = 1.0
+            violation = F.relu(max_air_logit[gt_is_structure] - max_non_air_logit[gt_is_structure] + margin)
+            false_air_loss = violation.mean()
+        else:
+            false_air_loss = torch.tensor(0.0, device=device)
+
+        # Perceptual loss on latent
+        perceptual_loss = self._compute_perceptual_loss(z_q)
+
+        # === 2. Structural coherence losses ===
+        L_connectivity = self.connectivity_loss(reconstructed)
+        L_patch = self.patch_loss(reconstructed)
+        L_support = self.support_loss(reconstructed)
+
+        # Smoothness requires embeddings
+        if self.block_embeddings is not None:
+            recon_emb = self.block_embeddings[reconstructed]  # [B, H, W, D, C]
+            recon_emb = recon_emb.permute(0, 4, 1, 2, 3)  # [B, C, H, W, D]
+            L_smooth = self.smooth_loss(reconstructed, recon_emb)
+        else:
+            L_smooth = torch.tensor(0.0, device=device)
+
+        # === 3. Adversarial loss ===
+        L_adv = torch.tensor(0.0, device=device)
+        if compute_adversarial and self.discriminator is not None and self.block_embeddings is not None:
+            # Get embeddings for reconstructed structure
+            recon_emb = self.block_embeddings[reconstructed].permute(0, 4, 1, 2, 3)
+            # Discriminator forward
+            d_recon = self.discriminator(recon_emb)
+            # Generator wants discriminator to think reconstructed is real
+            L_adv = -d_recon.mean()  # Hinge loss generator
+
+        # === Combine all losses ===
+        total_loss = (
+            ce_loss +
+            self.volume_penalty_weight * volume_loss +
+            self.false_air_penalty_weight * false_air_loss +
+            self.perceptual_weight * perceptual_loss +
+            self.lambda_connectivity * L_connectivity +
+            self.lambda_patch * L_patch +
+            self.lambda_smooth * L_smooth +
+            self.lambda_support * L_support +
+            self.lambda_adv * L_adv
+        )
+
+        # === Compute metrics ===
+        with torch.no_grad():
+            pred_is_air = torch.isin(reconstructed, air_tokens_tensor)
+            pred_volume = (~pred_is_air).float().sum()
+            gt_volume = gt_is_structure.float().sum()
+            volume_ratio = pred_volume / (gt_volume + 1e-6)
+
+            # Recall
+            structure_preserved = gt_is_structure & (~pred_is_air)
+            recall = structure_preserved.float().sum() / (gt_is_structure.float().sum() + 1e-6)
+
+            # Accuracy
+            correct = (reconstructed == target)
+            building_acc = correct[gt_is_structure].float().mean() if gt_is_structure.any() else torch.tensor(0.0)
+
+        return {
+            'loss': total_loss,
+            'ce_loss': ce_loss.detach(),
+            'volume_loss': volume_loss.detach(),
+            'false_air_loss': false_air_loss.detach() if torch.is_tensor(false_air_loss) else false_air_loss,
+            'perceptual_loss': perceptual_loss.detach(),
+            'connectivity_loss': L_connectivity.detach(),
+            'patch_loss': L_patch.detach(),
+            'smooth_loss': L_smooth.detach() if torch.is_tensor(L_smooth) else L_smooth,
+            'support_loss': L_support.detach(),
+            'adv_loss': L_adv.detach() if torch.is_tensor(L_adv) else L_adv,
+            'volume_ratio': volume_ratio,
+            'recall': recall,
+            'building_acc': building_acc,
+        }
+
+    def _compute_perceptual_loss(self, z_q: torch.Tensor) -> torch.Tensor:
+        """Compute spatial smoothness on latent codes."""
+        diff_h = (z_q[:, :, 1:, :, :] - z_q[:, :, :-1, :, :]).abs().mean()
+        diff_w = (z_q[:, :, :, 1:, :] - z_q[:, :, :, :-1, :]).abs().mean()
+        diff_d = (z_q[:, :, :, :, 1:] - z_q[:, :, :, :, :-1]).abs().mean()
+        return (diff_h + diff_w + diff_d) / 3.0
+
+    def set_lambda_adv(self, value: float):
+        """Update adversarial loss weight (for scheduling)."""
+        self.lambda_adv = value
