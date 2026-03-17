@@ -549,6 +549,8 @@ def main():
             PROJECT_ROOT / "data" / "splits" / "train",
             PROJECT_ROOT / "data" / "splits" / "val",
             PROJECT_ROOT / "data" / "splits" / "test",
+            PROJECT_ROOT / "data" / "processed_new",
+            PROJECT_ROOT / "data" / "procedural",
         ]
     )
 
